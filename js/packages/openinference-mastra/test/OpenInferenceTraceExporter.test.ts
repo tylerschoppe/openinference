@@ -791,4 +791,481 @@ describe("OpenInferenceTraceExporter", () => {
       "Output for trace B",
     );
   });
+
+  describe("Span buffering for multi-batch exports", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("should buffer child spans until root span arrives in subsequent batch", async () => {
+      const traceId = "trace-buffering-test";
+      
+      // Child spans that arrive first (no root span yet)
+      const childSpan1 = {
+        name: "agent.process",
+        parentSpanContext: { spanId: "root-id" },
+        spanContext: () => ({
+          spanId: "child1-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const childSpan2 = {
+        name: "ai.streamText",
+        parentSpanContext: { spanId: "root-id" },
+        spanContext: () => ({
+          spanId: "child2-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { [SemanticConventions.OUTPUT_VALUE]: "Test output" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      // Root span that arrives later
+      const rootSpan = {
+        name: "POST /api/test",
+        parentSpanContext: undefined, // This is a root span
+        spanContext: () => ({
+          spanId: "root-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { "http.method": "POST" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+      });
+
+      // First batch: child spans only (should be buffered)
+      exporter.export([childSpan1, childSpan2], () => {});
+      
+      // Should not have exported anything yet
+      expect(OTLPTraceExporter.prototype.export).not.toHaveBeenCalled();
+
+      // Second batch: root span arrives (should trigger processing of all spans)
+      exporter.export([rootSpan], () => {});
+
+      // Should have exported all 3 spans together
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const exportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      expect(exportedSpans).toHaveLength(3);
+      
+      // Should have processed all spans with contextualization
+      const exportedRootSpan = exportedSpans.find((s: ReadableSpan) => s.name === "POST /api/test");
+      expect(exportedRootSpan.attributes[SemanticConventions.OUTPUT_VALUE]).toBe("Test output");
+    });
+
+    it("should flush buffered spans after timeout when no root span arrives", async () => {
+      const traceId = "trace-timeout-test";
+      
+      const childSpan = {
+        name: "agent.process",
+        parentSpanContext: { spanId: "root-id" },
+        spanContext: () => ({
+          spanId: "child-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+        traceBufferTtlMs: 1000, // 1 second TTL per trace
+      });
+
+      // Export child span (should be buffered)
+      exporter.export([childSpan], () => {});
+      
+      // Should not have exported anything yet
+      expect(OTLPTraceExporter.prototype.export).not.toHaveBeenCalled();
+
+      // Fast-forward time to trigger timeout
+      vi.advanceTimersByTime(1000);
+
+      // Should have exported the buffered span after timeout
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const exportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      expect(exportedSpans).toHaveLength(1);
+      expect(exportedSpans[0].name).toBe("agent.process");
+    });
+
+    it("should handle mixed batches with complete and incomplete traces", async () => {
+      const completeTraceId = "complete-trace";
+      const incompleteTraceId = "incomplete-trace";
+      
+      // Complete trace (has root span)
+      const completeRootSpan = {
+        name: "POST /api/complete",
+        parentSpanContext: undefined,
+        spanContext: () => ({
+          spanId: "complete-root-id",
+          traceId: completeTraceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { "http.method": "POST" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const completeChildSpan = {
+        name: "agent.process",
+        parentSpanContext: { spanId: "complete-root-id" },
+        spanContext: () => ({
+          spanId: "complete-child-id",
+          traceId: completeTraceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      // Incomplete trace (missing root span)
+      const incompleteChildSpan = {
+        name: "agent.process",
+        parentSpanContext: { spanId: "incomplete-root-id" },
+        spanContext: () => ({
+          spanId: "incomplete-child-id",
+          traceId: incompleteTraceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-2" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+      });
+
+      // Export mixed batch
+      exporter.export([completeRootSpan, completeChildSpan, incompleteChildSpan], () => {});
+
+      // Should have exported the complete trace immediately
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const exportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      expect(exportedSpans).toHaveLength(2); // Only complete trace spans
+      
+      const exportedTraceIds = new Set(exportedSpans.map((s: ReadableSpan) => s.spanContext().traceId));
+      expect(exportedTraceIds.has(completeTraceId)).toBe(true);
+      expect(exportedTraceIds.has(incompleteTraceId)).toBe(false);
+    });
+
+    it("should schedule efficient timeouts for multiple traces with different start times", async () => {
+      const traceId1 = "trace-reset-timeout-1";
+      const traceId2 = "trace-reset-timeout-2";
+      
+      const childSpan1 = {
+        name: "agent.process1",
+        parentSpanContext: { spanId: "root-id-1" },
+        spanContext: () => ({
+          spanId: "child1-id",
+          traceId: traceId1,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const childSpan2 = {
+        name: "agent.process2",
+        parentSpanContext: { spanId: "root-id-2" },
+        spanContext: () => ({
+          spanId: "child2-id",
+          traceId: traceId2,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+        traceBufferTtlMs: 1000,
+      });
+
+      // First export
+      exporter.export([childSpan1], () => {});
+      
+      // Advance time by 500ms
+      vi.advanceTimersByTime(500);
+      
+      // Second export starts its own TTL timer
+      exporter.export([childSpan2], () => {});
+      
+      // Advance another 600ms (total 1100ms from first export, 600ms from second)
+      vi.advanceTimersByTime(600);
+      
+      // First trace should have expired (exceeded 1000ms TTL)
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const firstExportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      expect(firstExportedSpans).toHaveLength(1);
+      expect(firstExportedSpans[0].spanContext().traceId).toBe(traceId1);
+      
+      // Advance by remainder to flush second trace (400ms more = 1000ms total for second trace)
+      vi.advanceTimersByTime(400);
+      
+      // Second trace should now be exported
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(2);
+      const secondExportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[1][0];
+      expect(secondExportedSpans).toHaveLength(1);
+      expect(secondExportedSpans[0].spanContext().traceId).toBe(traceId2);
+    });
+
+    it("should preserve contextualization across multiple batches", async () => {
+      const traceId = "trace-contextualization";
+      
+      // Agent span with agent operation
+      const agentSpan = {
+        name: "agent.process",
+        parentSpanContext: { spanId: "root-id" },
+        spanContext: () => ({
+          spanId: "agent-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      // Input span
+      const inputSpan = {
+        name: "agent.getMostRecentUserMessage",
+        parentSpanContext: { spanId: "root-id" },
+        spanContext: () => ({
+          spanId: "input-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: {
+          "agent.getMostRecentUserMessage.result": JSON.stringify({
+            id: "msg-123",
+            role: "user",
+            content: "test input message",
+            createdAt: "2025-01-15T10:00:00Z",
+          }),
+        },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      // Root span (unlabeled, should be marked as AGENT)
+      const rootSpan = {
+        name: "POST /api/agent",
+        parentSpanContext: undefined,
+        spanContext: () => ({
+          spanId: "root-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { "http.method": "POST" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+      });
+
+      // First batch: child spans
+      exporter.export([agentSpan, inputSpan], () => {});
+      
+      // Second batch: root span
+      exporter.export([rootSpan], () => {});
+
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const exportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      
+      // Check that root span was marked as AGENT (contextualization worked)
+      const exportedRootSpan = exportedSpans.find((s: ReadableSpan) => s.name === "POST /api/agent");
+      expect(exportedRootSpan.attributes[SemanticConventions.OPENINFERENCE_SPAN_KIND]).toBe("AGENT");
+      
+      // Check that I/O was added to root span
+      expect(exportedRootSpan.attributes[SemanticConventions.INPUT_VALUE]).toBe("test input message");
+    });
+
+    it("should only flush traces that exceed their individual TTL", async () => {
+      const traceId1 = "trace-ttl-1";
+      const traceId2 = "trace-ttl-2";
+      
+      const span1 = {
+        name: "agent.process1",
+        parentSpanContext: { spanId: "root-id-1" },
+        spanContext: () => ({
+          spanId: "span1-id",
+          traceId: traceId1,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const span2 = {
+        name: "agent.process2",
+        parentSpanContext: { spanId: "root-id-2" },
+        spanContext: () => ({
+          spanId: "span2-id",
+          traceId: traceId2,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-2" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+        traceBufferTtlMs: 1000, // 1 second TTL
+      });
+
+      // Export first span
+      exporter.export([span1], () => {});
+      
+      // Advance time by 500ms
+      vi.advanceTimersByTime(500);
+      
+      // Export second span (starts its own TTL)
+      exporter.export([span2], () => {});
+      
+      // Advance time by 600ms (total 1100ms for first span, 600ms for second)
+      vi.advanceTimersByTime(600);
+      
+      // Only first span should be flushed (exceeded 1000ms TTL)
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const exportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      expect(exportedSpans).toHaveLength(1);
+      expect(exportedSpans[0].spanContext().traceId).toBe(traceId1);
+      
+      // Advance another 500ms to flush second span
+      vi.advanceTimersByTime(500);
+      
+      // Second span should now be flushed
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(2);
+      const secondExportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[1][0];
+      expect(secondExportedSpans).toHaveLength(1);
+      expect(secondExportedSpans[0].spanContext().traceId).toBe(traceId2);
+    });
+
+    it("should use global TTL as fallback when trace TTL is not reached", async () => {
+      const traceId = "trace-global-ttl";
+      
+      const span = {
+        name: "agent.process",
+        parentSpanContext: { spanId: "root-id" },
+        spanContext: () => ({
+          spanId: "span-id",
+          traceId,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+        traceBufferTtlMs: 5000, // 5 second trace TTL
+        globalBufferTtlMs: 2000, // 2 second global TTL (shorter)
+      });
+
+      // Export span
+      exporter.export([span], () => {});
+      
+      // Advance time to just before global TTL but after trace TTL would normally trigger
+      vi.advanceTimersByTime(1500);
+      
+      // Should not have exported yet
+      expect(OTLPTraceExporter.prototype.export).not.toHaveBeenCalled();
+      
+      // Advance past global TTL
+      vi.advanceTimersByTime(600); // Total 2100ms > 2000ms global TTL
+      
+      // Should have exported due to global TTL
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const exportedSpans = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      expect(exportedSpans).toHaveLength(1);
+      expect(exportedSpans[0].spanContext().traceId).toBe(traceId);
+    });
+
+    it("should dynamically adjust check intervals based on shortest TTL", async () => {
+      const traceId1 = "trace-short-ttl";
+      const traceId2 = "trace-long-ttl";
+      
+      const span1 = {
+        name: "agent.process1",
+        parentSpanContext: { spanId: "root-id-1" },
+        spanContext: () => ({
+          spanId: "span1-id",
+          traceId: traceId1,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-1" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const span2 = {
+        name: "agent.process2",
+        parentSpanContext: { spanId: "root-id-2" },
+        spanContext: () => ({
+          spanId: "span2-id",
+          traceId: traceId2,
+          traceFlags: 0,
+          traceState: undefined,
+        }),
+        attributes: { threadId: "thread-2" },
+        resource: { attributes: {} },
+      } as unknown as ReadableSpan;
+
+      const exporter = new OpenInferenceOTLPTraceExporter({
+        url: "http://example.com/v1/traces",
+        traceBufferTtlMs: 1000,
+      });
+
+      // Export first span
+      exporter.export([span1], () => {});
+      
+      // Advance time by 800ms
+      vi.advanceTimersByTime(800);
+      
+      // Export second span (200ms left for first span to expire)
+      exporter.export([span2], () => {});
+      
+      // Advance by 250ms - should flush first span but not second
+      vi.advanceTimersByTime(250);
+      
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(1);
+      const firstExport = (OTLPTraceExporter.prototype.export as Mock).mock.calls[0][0];
+      expect(firstExport).toHaveLength(1);
+      expect(firstExport[0].spanContext().traceId).toBe(traceId1);
+      
+      // Advance by remainder to flush second span
+      vi.advanceTimersByTime(750);
+      
+      expect(OTLPTraceExporter.prototype.export).toHaveBeenCalledTimes(2);
+      const secondExport = (OTLPTraceExporter.prototype.export as Mock).mock.calls[1][0];
+      expect(secondExport).toHaveLength(1);
+      expect(secondExport[0].spanContext().traceId).toBe(traceId2);
+    });
+  });
 });
